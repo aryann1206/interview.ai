@@ -1,6 +1,6 @@
 import express from 'express';
 import { GoogleGenAI, Modality } from "@google/genai";
-const client = new GoogleGenAI({apiKey: "AIzaSyDY2hQy8UiiVu-CWZYrf6DolH3lh1H7wMs"});
+const client = new GoogleGenAI({apiKey: ""});
 const expireTime = new Date(Date.now() + 30 * 60 * 1000).toISOString();
 const app = express();
 import cors from 'cors'; //
