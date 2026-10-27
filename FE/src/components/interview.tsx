@@ -1,324 +1,294 @@
-import { Mic, X, Home } from "lucide-react"
-import "../index.css";
-import { useState, useRef, useEffect } from "react";
+import { AudioLines, Mic, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { GoogleGenAI, Modality, Session } from "@google/genai";
+import { GoogleGenAI, Modality, type Session } from "@google/genai";
+import "../index.css";
 
-let audioCtx: AudioContext | null = null;
-
-interface Message {
-  role: "user" | "model";
-  text: string;
-}
 const MODEL = "gemini-3.1-flash-live-preview";
-interface form {
-  name: string,
-  role: string,
-  difficulty: string,
-  tech: string
-}
+type Status = "idle" | "connecting" | "listening" | "speaking" | "error" | "ended";
+type InterviewDetails = { name: string; role: string; difficulty: string; tech: string };
+
 export function Interview() {
-  const location = useLocation();
+  const { state } = useLocation() as { state: InterviewDetails | null };
   const navigate = useNavigate();
-
-  const state = location.state as form | null;
-
-  useEffect(() => {
-    if (!state) navigate("/");
-  }, [state, navigate]);
-
-  if (!state) return null;
-
-  const { name, role, difficulty, tech } = state;
-
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [status, setStatus] = useState<Status>("idle");
+  const [error, setError] = useState("");
+  const [transcript, setTranscript] = useState("");
+  const transcriptRef = useRef<HTMLParagraphElement | null>(null);
+  const statusRef = useRef<Status>("idle");
+  const endedRef = useRef(false);
   const sessionRef = useRef<Session | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<AudioWorkletNode | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<AudioWorkletNode | null>(null);
   const workletLoadedRef = useRef(false);
-  const [allow, setallow] = useState(false);
-  const [end, setend] = useState(false);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const audioQueueRef = useRef<string[]>([]);
+  const playingRef = useRef(false);
+  const turnCompleteRef = useRef(false);
 
-  useEffect(() => {
-    connect();
-  }, []);
+  function changeStatus(next: Status) {
+    statusRef.current = next;
+    setStatus(next);
+  }
+
+  function isSpeaking() {
+    return statusRef.current === "speaking";
+  }
 
   function stopMic() {
-    try {
-      streamRef.current?.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-
-      processorRef.current?.disconnect();
-      processorRef.current = null;
-
-      sourceRef.current?.disconnect();
-      sourceRef.current = null;
-    } catch {}
+    processorRef.current?.disconnect();
+    processorRef.current = null;
+    sourceRef.current?.disconnect();
+    sourceRef.current = null;
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
   }
 
-  function playAudio(base64: string, onEnd?: () => void) {
-    const binary = atob(base64);
-    const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-    const pcm16 = new Int16Array(bytes.buffer);
-
-    const sampleRate = 24000;
-
-    stopMic();
-
-    setallow(true);
-
-    const buffer = audioCtx!.createBuffer(1, pcm16.length, sampleRate);
-    const channel = buffer.getChannelData(0);
-
-    for (let i = 0; i < pcm16.length; i++) {
-      channel[i] = pcm16[i]! / 32768;
+  function stopPlayback() {
+    audioQueueRef.current = [];
+    turnCompleteRef.current = false;
+    playingRef.current = false;
+    const source = audioSourceRef.current;
+    audioSourceRef.current = null;
+    if (source) {
+      source.onended = null;
+      try { source.stop(); } catch { /* Already stopped. */ }
+      source.disconnect();
     }
-
-    const source = audioCtx!.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioCtx!.destination);
-    audioSourceRef.current = source;
-    source.onended = onEnd!;
-    source.start();
   }
-  let queue: string[] = [];
-  let isPlaying = false;
 
-  function enqueueAudio(base64: string) {
-    queue.push(base64);
-    if (!isPlaying) playNext();
+  function closeSession() {
+    endedRef.current = true;
+    stopMic();
+    stopPlayback();
+    sessionRef.current?.close();
+    sessionRef.current = null;
+    void audioContextRef.current?.close();
+    audioContextRef.current = null;
+  }
+
+  useEffect(() => {
+    if (!state) navigate("/", { replace: true });
+    return () => closeSession();
+  }, []);
+
+  useEffect(() => {
+    const panel = transcriptRef.current;
+    if (panel) panel.scrollTop = panel.scrollHeight;
+  }, [transcript]);
+
+  async function startMic() {
+    if (endedRef.current || !sessionRef.current || streamRef.current) return;
+    try {
+      const context = audioContextRef.current;
+      if (!context) throw new Error("Audio is unavailable. Please restart the interview.");
+      if (context.state === "suspended") await context.resume();
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      if (endedRef.current || isSpeaking()) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      streamRef.current = stream;
+      if (!workletLoadedRef.current) {
+        const code = `class PCMProcessor extends AudioWorkletProcessor {
+          process(inputs) {
+            const channel = inputs[0]?.[0];
+            if (channel) this.port.postMessage(channel);
+            return true;
+          }
+        }
+        registerProcessor("pcm-processor", PCMProcessor);`;
+        const url = URL.createObjectURL(new Blob([code], { type: "application/javascript" }));
+        try { await context.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+        workletLoadedRef.current = true;
+      }
+      if (endedRef.current || isSpeaking()) { stopMic(); return; }
+      const source = context.createMediaStreamSource(stream);
+      const processor = new AudioWorkletNode(context, "pcm-processor", {
+        numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1,
+      });
+      sourceRef.current = source;
+      processorRef.current = processor;
+      processor.port.onmessage = event => {
+        if (endedRef.current || statusRef.current !== "listening" || !sessionRef.current) return;
+        try {
+          sessionRef.current.sendRealtimeInput({
+            audio: { data: encodePCM(event.data as Float32Array, context.sampleRate), mimeType: "audio/pcm;rate=16000" },
+          });
+        } catch (cause) { showError(cause); }
+      };
+      source.connect(processor);
+      changeStatus("listening");
+    } catch (cause) {
+      stopMic();
+      showError(cause);
+    }
   }
 
   function playNext() {
-    if (queue.length === 0) {
-      isPlaying = false;
-      startMic();
-      setallow(false);
-      setMessages([]);
+    if (endedRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) {
+      playingRef.current = false;
+      audioSourceRef.current = null;
+      if (turnCompleteRef.current) {
+        turnCompleteRef.current = false;
+        resumeListening();
+      }
       return;
     }
-    isPlaying = true;
-    const base64 = queue.shift()!;
-    playAudio(base64, playNext);
+    const context = audioContextRef.current;
+    if (!context) { showError(new Error("Audio output is unavailable.")); return; }
+    try {
+      const bytes = Uint8Array.from(atob(next), character => character.charCodeAt(0));
+      const samples = new Int16Array(bytes.buffer);
+      const buffer = context.createBuffer(1, samples.length, 24000);
+      const channel = buffer.getChannelData(0);
+      for (let i = 0; i < samples.length; i++) channel[i] = samples[i]! / 32768;
+      const source = context.createBufferSource();
+      source.buffer = buffer;
+      source.connect(context.destination);
+      source.onended = () => { source.disconnect(); audioSourceRef.current = null; playNext(); };
+      audioSourceRef.current = source;
+      source.start();
+    } catch (cause) { showError(cause); }
+  }
+
+  function resumeListening() {
+    if (endedRef.current) return;
+    changeStatus("listening");
+    void startMic();
+  }
+
+  function showError(cause: unknown) {
+    if (endedRef.current) return;
+    const message = cause instanceof Error ? cause.message : "Something went wrong. Please try again.";
+    setError(message);
+    changeStatus("error");
+    stopMic();
+    stopPlayback();
+    sessionRef.current?.close();
+    sessionRef.current = null;
   }
 
   async function connect() {
+    if (endedRef.current || statusRef.current === "connecting") return;
+    setError("");
+    changeStatus("connecting");
     try {
-      const res = await fetch("http://localhost:3000/temp/token", { method: "POST" });
-      const data = await res.json();
-
-      if (!res.ok) throw new Error(data.error);
-
-      const ai = new GoogleGenAI({
-        apiKey: data.token,
-        httpOptions: { apiVersion: "v1alpha" },
-      });
-
+      if (!audioContextRef.current || audioContextRef.current.state === "closed") {
+        audioContextRef.current = new AudioContext({ sampleRate: 16000 });
+        workletLoadedRef.current = false;
+      }
+      await audioContextRef.current.resume();
+      const response = await fetch("http://localhost:3000/temp/token", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok || !data.token) throw new Error(data.error || "Could not start the interview. Check the backend and API key.");
+      if (endedRef.current) return;
+      const ai = new GoogleGenAI({ apiKey: data.token, httpOptions: { apiVersion: "v1beta" } });
       const session = await ai.live.connect({
         model: MODEL,
         config: {
           responseModalities: [Modality.AUDIO],
           outputAudioTranscription: {},
-          systemInstruction: `
-          -you start the conversation say hi 
-          You are interviewing ${name} for a ${role} ${tech} role.
-          Difficulty level: ${difficulty}       
-          Rules:
-          - Ask one question at a time
-          - Start easy → increase difficulty
-          - Be conversational
-          - After 5 questions, give a score out of 10 with feedback
-          -dont be with strict 5 questions..if he wants any clarification about the question help him with that  
-          -You are a professional interviewer.
-          `,
+          systemInstruction: `You are a professional interviewer. Interview ${state?.name} for a ${state?.role} role using ${state?.tech}. Difficulty: ${state?.difficulty}. Ask one question at a time, be conversational, offer clarification when asked, and give a score out of 10 with feedback after about five questions.`,
         },
         callbacks: {
-          onmessage: (msg: any) => {
-            const transcription: string = msg.serverContent?.outputTranscription?.text;
-            const content = msg.serverContent;
-            if (content?.modelTurn?.parts) {
-              for (const part of content.modelTurn.parts) {
-                if (part.inlineData?.data) {
-                  enqueueAudio(part.inlineData.data);
+          onmessage: message => {
+            if (endedRef.current) return;
+            const content = message.serverContent;
+            const text = content?.outputTranscription?.text;
+            if (text) setTranscript(previous => previous + text);
+            if (content?.interrupted) {
+              stopPlayback();
+              resumeListening();
+              return;
+            }
+            for (const part of content?.modelTurn?.parts ?? []) {
+              if (part.inlineData?.data) {
+                if (statusRef.current !== "speaking") {
+                  stopMic();
+                  changeStatus("speaking");
+                }
+                audioQueueRef.current.push(part.inlineData.data);
+                if (!playingRef.current) {
+                  playingRef.current = true;
+                  playNext();
                 }
               }
             }
-
-            setMessages((prev) => [...prev, { role: "model", text: transcription }]);
+            if (content?.turnComplete) {
+              turnCompleteRef.current = true;
+              if (!playingRef.current) resumeListening();
+            }
           },
+          onerror: () => showError(new Error("The interview connection was interrupted. Start a new session.")),
           onclose: () => {
             sessionRef.current = null;
-            stopMic();
+            if (!endedRef.current && statusRef.current !== "error") showError(new Error("The interview connection closed. Start a new session."));
           },
         },
       });
-
+      if (endedRef.current) { session.close(); return; }
       sessionRef.current = session;
-    } catch {}
-  }
-
-  async function startMic() {
-    if (end) return;
-  
-    try {
-      if (!audioCtx) {
-        audioCtx = new AudioContext({ sampleRate: 16000 });
-      }
-      if (audioCtx.state === "suspended") {
-        await audioCtx.resume();
-      }
-      if (streamRef.current) return;
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-  
-      const source = audioCtx.createMediaStreamSource(stream);
-      sourceRef.current = source;
-
-      if (!workletLoadedRef.current) {
-        const workletCode = `
-          class PCMProcessor extends AudioWorkletProcessor {
-            process(inputs) {
-              const input = inputs[0];
-              if (!input || input.length === 0) return true;
-              const channel = input[0];
-              if (channel) this.port.postMessage(channel);
-              return true;
-            }
-          }
-          registerProcessor("pcm-processor", PCMProcessor);
-        `;
-        const workletUrl = URL.createObjectURL(
-          new Blob([workletCode], { type: "application/javascript" })
-        );
-        await audioCtx.audioWorklet.addModule(workletUrl);
-        URL.revokeObjectURL(workletUrl);
-        workletLoadedRef.current = true;
-      }
-
-      const processor = new AudioWorkletNode(audioCtx, "pcm-processor", {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        channelCount: 1,
+      changeStatus("speaking");
+      session.sendClientContent({
+        turns: [{ role: "user", parts: [{ text: "Begin the interview. Greet me briefly and ask your first question." }] }],
+        turnComplete: true,
       });
-      processorRef.current = processor;
-
-      processor.port.onmessage = (e) => {
-        if (!sessionRef.current || end) return;
-        const input = e.data as Float32Array;
-        const base64 = encodePCM(input, audioCtx!.sampleRate);
-
-        sessionRef.current.sendRealtimeInput({
-          audio: {
-            data: base64,
-            mimeType: "audio/pcm;rate=16000",
-          },
-        });
-      };
-
-      source.connect(processor);
-      processor.connect(audioCtx.destination);
-  
-    } catch {}
+    } catch (cause) { showError(cause); }
   }
 
-  return (
-    <div className="min-h-screen w-screen bg-black text-white flex flex-col items-center justify-center py-10">
-      <h1 className="absolute top-6 text-gray-500 text-sm tracking-widest">
-        INTERVIEW.AI
-      </h1>
+  function endInterview() {
+    closeSession();
+    changeStatus("ended");
+  }
 
-      <div className="flex flex-col items-center gap-12 w-full">
+  if (!state) return null;
+  const { name, role, difficulty, tech } = state;
+  const speaking = status === "speaking";
+  const ended = status === "ended";
+  const heading = ended ? <>Well <em>done.</em></> : speaking ? <>Listen <em>closely.</em></> : status === "connecting" ? <>Getting <em>ready.</em></> : status === "error" ? <>Let's <em>retry.</em></> : status === "idle" ? <>Ready to <em>begin?</em></> : <>You're <em>on air.</em></>;
+  const note = ended ? "Every conversation makes the next one easier." : status === "connecting" ? "Connecting to your interviewer..." : status === "error" ? error : status === "idle" ? "Start when you're ready. Allow microphone access when prompted." : speaking ? "Take your time. Your turn is next." : "Speak naturally when you're ready.";
 
-        <div className={`w-40 h-40 rounded-full flex items-center justify-center text-lg font-medium transition-all duration-300
-        ${allow
-            ? "bg-blue-600 scale-110 shadow-[0_0_60px_#2563eb]"
-            : "bg-green-500 shadow-[0_0_40px_#22c55e]"}`}>
-          {allow ? "AI" : "YOU"}
+  return <main className="site-shell">
+    <header className="site-header wrap"><a className="brand" href="/" aria-label="Interview AI home"><span className="brand-mark"><Mic size={19} /></span><span>interview<span className="brand-dot">.</span>ai</span></a><span className="availability"><span className="status-dot" /> {ended ? "SESSION COMPLETE" : status === "error" ? "CONNECTION ERROR" : status === "idle" ? "READY" : "LIVE SESSION"}</span></header>
+    <div className="wrap session-layout">
+      <section className="session-main" aria-label="Live interview">
+        <div className="session-overline"><span>VOICE INTERVIEW / 001</span><span>{status.toUpperCase()} ●</span></div>
+        <div className="session-stage">
+          <div className={`voice-orbit ${ended ? "ended" : speaking ? "speaking" : ""}`}><div className="voice-core">{ended ? <X size={44} strokeWidth={1.5} /> : speaking ? <AudioLines size={48} strokeWidth={1.5} /> : <Mic size={48} strokeWidth={1.5} />}</div></div>
+          <div className="session-state">{ended ? "Session ended" : status === "error" ? "Connection issue" : status === "idle" ? "Ready when you are" : status === "connecting" ? "Connecting" : speaking ? "Interviewer speaking" : "Your turn to speak"}</div>
+          <h1 className="interview-title">{heading}</h1>
+          <p className="stage-help" role={status === "error" ? "alert" : undefined}>{note}</p>
+          {ended && <a className="back-link" href="/">← Start another session</a>}
         </div>
-
-        <p className="text-gray-400 text-sm">
-          {end ? "Session Ended" : allow ? "AI is speaking..." : "Listening..."}
-        </p>
-
-        <div className="w-full max-w-3xl px-6">
-          {end ? (
-            <p className="text-center text-gray-400 text-lg">Session ended !</p>
-          ) : (
-            <div className="text-center text-xl font-light text-gray-200 leading-relaxed tracking-wide bg-white/5 backdrop-blur-md px-6 py-4 rounded-xl break-words">
-              {messages.length === 0
-                ? "Start speaking..."
-                : messages.map((msg, i) => (
-                  <span key={i} className="mr-2">{msg.text}</span>
-                ))}
-            </div>
-          )}
-        </div>
-
-        <div className="flex gap-6 mt-6">
-
-          <button
-            onClick={startMic}
-            disabled={allow}
-            className={`p-4 rounded-full transition ${
-              allow
-                ? "bg-gray-700 cursor-not-allowed"
-                : "bg-green-500 hover:scale-110"
-            }`}
-          >
-            <Mic size={28} />
-          </button>
-
-          <button
-            onClick={() => {
-              queue = [];
-              try {
-                audioSourceRef.current?.stop(0);
-              } catch {}
-              audioSourceRef.current = null;
-              stopMic();
-              sessionRef.current?.close();
-              sessionRef.current = null;
-              setend(true);
-            }}
-            className="p-4 rounded-full bg-red-600 hover:scale-110 transition"
-          >
-            <X size={28} />
-          </button>
-        </div>
-
-        {end && (
-          <button
-            onClick={() => navigate("/")}
-            className="mt-4 text-sm text-gray-400 hover:text-white"
-          >
-            ← Back to Home
-          </button>
-        )}
-      </div>
+        <div className="session-controls"><span className="control-note">{ended ? "Your practice session has finished." : status === "idle" || status === "error" ? "Start the session to connect with your interviewer." : "Use the microphone to speak. End the session whenever you need."}</span><div className="control-buttons">
+          {(status === "idle" || status === "error") ? <button className="primary-button session-start" onClick={connect}>Start interview</button> : <button className="round-control" onClick={startMic} disabled={speaking || status === "connecting" || ended || status === "listening"} aria-label="Start microphone" title="Start microphone"><Mic size={21} /></button>}
+          <button className="round-control end-control" onClick={endInterview} disabled={ended} aria-label="End interview" title="End interview"><X size={21} /></button>
+        </div></div>
+      </section>
+      <aside className="session-aside">
+        <div className="aside-card"><div className="aside-overline"><span>SESSION BRIEF</span><span>FIG. 02A</span></div><div className="session-details"><div className="detail-row"><span>CANDIDATE</span><strong>{name}</strong></div><div className="detail-row"><span>TARGET ROLE</span><strong>{role}</strong></div><div className="detail-row"><span>TECH STACK</span><strong>{tech}</strong></div><div className="detail-row"><span>DIFFICULTY</span><strong className="level">{difficulty}</strong></div></div></div>
+        <div className="aside-card transcript-card"><div className="aside-overline"><span>LIVE TRANSCRIPT</span><span>↗</span></div><p ref={transcriptRef} className={transcript ? "transcript-text" : "transcript-text transcript-empty"} aria-live="polite">{transcript || (ended ? "Session complete." : "The conversation will appear here as it happens...")}</p><div className="transcript-foot">✳ WORDS IN MOTION</div></div>
+      </aside>
     </div>
-  );
+    <footer className="site-footer wrap"><span>© 2026 INTERVIEW.AI</span><span>PREPARE WITH PURPOSE ✳</span></footer>
+  </main>;
 }
 
-function encodePCM(float32Array: Float32Array, inputSampleRate: number) {
-  const targetRate = 16000;
-  const ratio = inputSampleRate / targetRate;
-  const newLength = Math.round(float32Array.length / ratio);
-  const result = new Int16Array(newLength);
-
-  for (let i = 0; i < newLength; i++) {
-    const sample = float32Array[Math.floor(i * ratio)]!;
-    const s = Math.max(-1, Math.min(1, sample));
-    result[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+function encodePCM(input: Float32Array, sampleRate: number) {
+  const ratio = sampleRate / 16000;
+  const output = new Int16Array(Math.floor(input.length / ratio));
+  for (let i = 0; i < output.length; i++) {
+    const sample = Math.max(-1, Math.min(1, input[Math.floor(i * ratio)] ?? 0));
+    output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
   }
-
-  const bytes = new Uint8Array(result.buffer);
+  const bytes = new Uint8Array(output.buffer);
   let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]!);
-  }
-
+  for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
 }
 

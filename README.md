@@ -7,6 +7,23 @@
 
 ## 🤖 AI Mock Interview Platform
 
+### Run locally
+
+Install [Bun](https://bun.com), then run these commands from the repository root:
+
+```powershell
+bun run setup
+Copy-Item .env.example .env
+```
+
+Put your Gemini API key in the new `.env` file, then start both services:
+
+```powershell
+bun run dev
+```
+
+Open **http://localhost:3001**. The voice backend runs at **http://localhost:3000**. Press **Ctrl+C** in the terminal to stop both services.
+
 A real-time AI-based interview simulator designed to replicate real-world technical interviews.
 
 The system interacts with users through voice, asks context-aware questions based on selected roles and technologies, and processes responses using live audio input.

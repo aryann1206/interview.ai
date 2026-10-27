@@ -1,7 +1,8 @@
 import express from 'express';
 import { GoogleGenAI, Modality } from "@google/genai";
-const client = new GoogleGenAI({apiKey: ""});
-const expireTime = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey) throw new Error("Set GEMINI_API_KEY before starting the backend.");
+const client = new GoogleGenAI({ apiKey });
 const app = express();
 import cors from 'cors'; //
 app.use(cors());
@@ -12,9 +13,9 @@ app.post("/temp/token", async (req, res) => {
         const token = await client.authTokens.create({
             config: {
                 uses: 1, // The default
-                expireTime: expireTime,
+                expireTime: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
                 httpOptions: {
-                    apiVersion: 'v1alpha'
+                    apiVersion: 'v1beta'
                 }
             }
         });
@@ -23,8 +24,9 @@ app.post("/temp/token", async (req, res) => {
             token:token.name
         })
     } catch (e) {
-        res.status(400).json({
-            message:"try again later"
+        console.error("Failed to create a live session token:", e);
+        res.status(502).json({
+            error:"Could not create an interview session. Check the backend API key and try again."
         })
     }
 

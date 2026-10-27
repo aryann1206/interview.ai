@@ -1,0 +1,8 @@
+{
+  "name": "interview-ai",
+  "private": true,
+  "scripts": {
+    "setup": "bun run setup.ts",
+    "dev": "bun run dev.ts"
+  }
+}
